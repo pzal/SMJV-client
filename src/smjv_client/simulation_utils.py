@@ -48,11 +48,19 @@ if __name__ == "__main__":
     t0 = time.time()
 
     pbar = tqdm(desc="steps")
+    step = 0
+    t0_session = time.time()
     try:
         while True:
             syncer.sync()
             pbar.update(1)
             pbar.display()
+            step += 1
+
+            if step % 20 == 0:
+                publisher.send_display(
+                    f"{time.time() - t0_session:.1f}s", label="elapsed"
+                )
 
             if time.time() > t0 + 5:
                 t0 = time.time()
@@ -64,5 +72,14 @@ if __name__ == "__main__":
             action_ori = (R.from_rotvec(target_ori) * current_ori.inv()).as_rotvec()
             obs, _, _, _ = env.step(np.concat([action_pos, action_ori, [0]]))
             publisher.publish_state()
+
+            if step % 20 == 0:
+                inp = publisher.consume_latest_input()
+                if inp is not None:
+                    r = inp["right"]
+                    print(
+                        f"R idx={r['index_trigger']:.2f} grip={r['hand_trigger']:.2f} "
+                        f"A={inp['A']} B={inp['B']} X={inp['X']} Y={inp['Y']}"
+                    )
     finally:
         publisher.close()
