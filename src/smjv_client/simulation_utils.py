@@ -48,18 +48,21 @@ if __name__ == "__main__":
     t0 = time.time()
 
     pbar = tqdm(desc="steps")
-    while True:
-        syncer.sync()
-        pbar.update(1)
-        pbar.display()
+    try:
+        while True:
+            syncer.sync()
+            pbar.update(1)
+            pbar.display()
 
-        if time.time() > t0 + 5:
-            t0 = time.time()
-            target_pos = target_pos_1 if target_pos is target_pos_2 else target_pos_2
+            if time.time() > t0 + 5:
+                t0 = time.time()
+                target_pos = target_pos_1 if target_pos is target_pos_2 else target_pos_2
 
-        current_pos = obs["robot0_eef_pos"]
-        current_ori = R.from_quat(obs["robot0_eef_quat_site"])
-        action_pos = target_pos - current_pos
-        action_ori = (R.from_rotvec(target_ori) * current_ori.inv()).as_rotvec()
-        obs, _, _, _ = env.step(np.concat([action_pos, action_ori, [0]]))
-        publisher.publish_state()
+            current_pos = obs["robot0_eef_pos"]
+            current_ori = R.from_quat(obs["robot0_eef_quat_site"])
+            action_pos = target_pos - current_pos
+            action_ori = (R.from_rotvec(target_ori) * current_ori.inv()).as_rotvec()
+            obs, _, _, _ = env.step(np.concat([action_pos, action_ori, [0]]))
+            publisher.publish_state()
+    finally:
+        publisher.close()

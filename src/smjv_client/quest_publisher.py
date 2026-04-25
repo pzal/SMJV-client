@@ -64,3 +64,14 @@ class QuestPublisher:
             ]
         payload = msgpack.packb({"data": state}, use_bin_type=True)
         self._loop.run_until_complete(self._send("poses", payload))
+
+    def close(self):
+        async def _close():
+            try:
+                await self._send("clear", b"")
+            except Exception:
+                pass
+            await self._ws.close()
+
+        self._loop.run_until_complete(_close())
+        self._loop.close()
