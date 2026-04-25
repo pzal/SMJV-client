@@ -1,3 +1,4 @@
+from smjv_client.vr import hide_arena_floor_and_walls
 import time
 import numpy as np
 from tqdm import tqdm
@@ -5,13 +6,15 @@ from scipy.spatial.transform import Rotation as R
 
 from robosuite.environments.manipulation.lift import Lift
 
+from smjv_client.quest_publisher import QuestPublisher
+
 
 class WallTimeSyncer:
     def __init__(self, hz: float):
         self._step_period = 1.0 / hz
         self._next_deadline = time.monotonic() + self._step_period
 
-    def sync(self) -> int:
+    def sync(self):
         sleep_for = self._next_deadline - time.monotonic()
         if sleep_for > 0:
             time.sleep(sleep_for)
@@ -28,6 +31,8 @@ if __name__ == "__main__":
         control_freq=FPS,
     )
     obs = env.reset()
+    hide_arena_floor_and_walls(env)
+    publisher = QuestPublisher(env)
 
     current_pos = obs["robot0_eef_pos"]
     delta = np.array([0, 0.35, 0])
@@ -57,3 +62,4 @@ if __name__ == "__main__":
         action_pos = target_pos - current_pos
         action_ori = (R.from_rotvec(target_ori) * current_ori.inv()).as_rotvec()
         obs, _, _, _ = env.step(np.concat([action_pos, action_ori, [0]]))
+        publisher.publish_state()

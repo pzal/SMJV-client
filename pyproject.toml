@@ -6,14 +6,18 @@ readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "ipython>=9.13.0",
+    "msgpack>=1.0",
     "numpy>=2",
     "python-dotenv>=1.2.2",
     "robosuite",
+    "simpub",
     "tqdm>=4.67.3",
+    "websockets>=13",
 ]
 
 [tool.uv.sources]
 robosuite = { git = "https://github.com/ARISE-Initiative/robosuite.git", rev = "95743f6" }
+simpub = { git = "https://github.com/intuitive-robots/SimPublisher.git" }
 
 [build-system]
 requires = ["hatchling"]
