@@ -122,6 +122,10 @@ class QuestPublisher:
         Returns None if no input frame has arrived yet. Analog values (poses,
         triggers, thumbsticks) reflect the latest sample; booleans (A/B/X/Y,
         thumbstick_click) are True if pressed in any frame since the last call.
+
+        ``rot`` on each hand is returned as ``[x, y, z, w]`` (scipy convention)
+        — the Unity app sends ``[w, x, y, z]`` which is reordered here so
+        callers can pass it directly to ``Rotation.from_quat()``.
         """
         with self._input_lock:
             if self._latest_input is None:
@@ -136,6 +140,12 @@ class QuestPublisher:
                 for k in _LATCHED_PER_HAND:
                     if k in hand_dict:
                         hand_dict[k] = False
+            # Unity wire format: rot = [w, x, y, z].  Reorder to scipy [x, y, z, w].
+            for hand in ("left", "right"):
+                hand_snap = snapshot.get(hand)
+                if hand_snap and "rot" in hand_snap:
+                    w, x, y, z = hand_snap["rot"]
+                    hand_snap["rot"] = [x, y, z, w]
             return snapshot
 
     def send_display(self, value, label: str = ""):
