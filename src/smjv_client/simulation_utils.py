@@ -79,7 +79,8 @@ if __name__ == "__main__":
                     r = inp["right"]
                     print(
                         f"R idx={r['index_trigger']:.2f} grip={r['hand_trigger']:.2f} "
-                        f"A={inp['A']} B={inp['B']} X={inp['X']} Y={inp['Y']}"
+                        f"A={inp['A']} B={inp['B']} X={inp['X']} Y={inp['Y']} "
+                        f"rec={inp.get('recording', False)}"
                     )
     finally:
         publisher.close()
