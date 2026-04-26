@@ -82,5 +82,10 @@ if __name__ == "__main__":
                         f"A={inp['A']} B={inp['B']} X={inp['X']} Y={inp['Y']} "
                         f"rec={inp.get('recording', False)}"
                     )
+
+            if step % 200 == 0:
+                print("RESETTING")
+                env.reset()
+                publisher.refresh(env)
     finally:
         publisher.close()

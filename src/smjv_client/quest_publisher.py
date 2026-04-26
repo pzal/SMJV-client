@@ -29,6 +29,7 @@ class QuestPublisher:
         self.quest_port = quest_port
 
         sim_scene = MjModelParser(self.model, visible_geoms_groups=[1]).parse()
+        self._sim_scene = sim_scene
 
         flat = []
 
@@ -39,6 +40,7 @@ class QuestPublisher:
                 walk(c)
 
         walk(sim_scene.root)
+        self._flat = flat
 
         self.tracked = {}
         for so in flat:
@@ -156,6 +158,28 @@ class QuestPublisher:
             ]
         payload = msgpack.packb({"data": state}, use_bin_type=True)
         self._run(self._send("poses", payload))
+
+    def refresh(self, env) -> None:
+        """Re-bind to env's fresh mj_model/mj_data after a hard reset and resend the scene.
+
+        robosuite's default ``hard_reset=True`` on ``env.reset()`` replaces
+        ``env.sim`` (and thus the raw mj_model/mj_data) on every reset,
+        orphaning the numpy views grabbed at construction time.  Call this
+        right after ``env.reset()`` to restore a working state.
+        """
+        self.model = env.sim.model._model
+        self.data = env.sim.data._data
+
+        self.tracked = {}
+        for so in self._flat:
+            bid = mj_name2id(self.model, mjtObj.mjOBJ_BODY, so["name"])
+            if bid >= 0:
+                self.tracked[so["name"]] = (self.data.xpos[bid], self.data.xquat[bid])
+
+        scene_payload = msgpack.packb(
+            {"config": self._sim_scene.config, "objects": self._flat}, use_bin_type=True
+        )
+        self._run(self._send("scene", scene_payload))
 
     def close(self):
         async def _close():
