@@ -7,7 +7,8 @@ import websockets
 from mujoco import mj_name2id, mjtObj
 from simpub.parser.mj import MjModelParser
 
-QUEST_IP = "127.0.0.1"  # fill in your Quest's IP, e.g. "192.168.1.42"
+QUEST_IP = "10.1.20.101"  # fill in your Quest's IP, e.g. "192.168.1.42"
+QUEST_IP = "10.1.10.100"  # fill in your Quest's IP, e.g. "192.168.1.42"
 PORT = 8765
 
 _LATCHED_BUTTONS = ("A", "B", "X", "Y")
@@ -21,9 +22,11 @@ class QuestPublisher:
     inbound recv task share the same socket without blocking each other.
     """
 
-    def __init__(self, env, visible_geoms_groups=range(5)):
+    def __init__(self, env, quest_ip=QUEST_IP, quest_port=PORT, visible_geoms_groups=range(5)):
         self.model = env.sim.model._model
         self.data = env.sim.data._data
+        self.quest_ip = quest_ip
+        self.quest_port = quest_port
 
         sim_scene = MjModelParser(self.model, visible_geoms_groups=[1]).parse()
 
@@ -72,7 +75,7 @@ class QuestPublisher:
 
     async def _connect(self):
         return await websockets.connect(
-            f"ws://{QUEST_IP}:{PORT}/sim", max_size=64 * 1024 * 1024
+            f"ws://{self.quest_ip}:{self.quest_port}/sim", max_size=64 * 1024 * 1024
         )
 
     async def _send(self, msg_type: str, data: bytes):
