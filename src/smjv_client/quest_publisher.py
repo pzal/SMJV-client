@@ -7,8 +7,6 @@ import websockets
 from mujoco import mj_name2id, mjtObj
 from simpub.parser.mj import MjModelParser
 
-QUEST_IP = "10.1.20.101"  # fill in your Quest's IP, e.g. "192.168.1.42"
-QUEST_IP = "10.1.10.100"  # fill in your Quest's IP, e.g. "192.168.1.42"
 PORT = 8765
 
 _LATCHED_BUTTONS = ("A", "B", "X", "Y")
@@ -22,7 +20,7 @@ class QuestPublisher:
     inbound recv task share the same socket without blocking each other.
     """
 
-    def __init__(self, env, quest_ip=QUEST_IP, quest_port=PORT, visible_geoms_groups=range(5)):
+    def __init__(self, env, quest_ip, quest_port=PORT, visible_geoms_groups=range(5)):
         self.model = env.sim.model._model
         self.data = env.sim.data._data
         self.quest_ip = quest_ip
@@ -54,9 +52,7 @@ class QuestPublisher:
         # Asyncio loop on a background thread; outbound publishes and inbound
         # recv share the same socket without blocking each other.
         self._loop = asyncio.new_event_loop()
-        self._loop_thread = threading.Thread(
-            target=self._loop.run_forever, daemon=True
-        )
+        self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._loop_thread.start()
 
         self._ws = self._run(self._connect())
