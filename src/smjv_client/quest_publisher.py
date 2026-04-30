@@ -1,11 +1,14 @@
 import asyncio
+import logging
 import threading
 from copy import deepcopy
 
 import msgpack
 import websockets
-from mujoco import mj_name2id, mjtObj
+from mujoco import mj_id2name, mj_name2id, mjtObj
 from simpub.parser.mj import MjModelParser
+
+logger = logging.getLogger(__name__)
 
 PORT = 8765
 
@@ -26,25 +29,9 @@ class QuestPublisher:
         self.quest_ip = quest_ip
         self.quest_port = quest_port
 
-        sim_scene = MjModelParser(self.model, visible_geoms_groups=[1]).parse()
-        self._sim_scene = sim_scene
-
-        flat = []
-
-        def walk(node):
-            if node.data is not None:
-                flat.append(node.data)
-            for c in node.children:
-                walk(c)
-
-        walk(sim_scene.root)
-        self._flat = flat
-
-        self.tracked = {}
-        for so in flat:
-            bid = mj_name2id(self.model, mjtObj.mjOBJ_BODY, so["name"])
-            if bid >= 0:
-                self.tracked[so["name"]] = (self.data.xpos[bid], self.data.xquat[bid])
+        self._parse_scene()
+        self._rebuild_tracked()
+        self._structure_fp = self._structure_fingerprint(self.model)
 
         self._latest_input = None
         self._input_lock = threading.Lock()
@@ -56,10 +43,7 @@ class QuestPublisher:
         self._loop_thread.start()
 
         self._ws = self._run(self._connect())
-        scene_payload = msgpack.packb(
-            {"config": sim_scene.config, "objects": flat}, use_bin_type=True
-        )
-        self._run(self._send("scene", scene_payload))
+        self._run(self._send("scene", self._scene_payload()))
 
         # Long-running coroutine: schedule and keep the Future for later cancel,
         # but DO NOT call .result() — that would block this thread forever.
@@ -70,6 +54,32 @@ class QuestPublisher:
     def _run(self, coro):
         """Run a short coroutine on the loop thread and block until it returns."""
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def _parse_scene(self) -> None:
+        sim_scene = MjModelParser(self.model, visible_geoms_groups=[1]).parse()
+        flat = []
+
+        def walk(node):
+            if node.data is not None:
+                flat.append(node.data)
+            for c in node.children:
+                walk(c)
+
+        walk(sim_scene.root)
+        self._sim_scene = sim_scene
+        self._flat = flat
+
+    def _rebuild_tracked(self) -> None:
+        self.tracked = {}
+        for so in self._flat:
+            bid = mj_name2id(self.model, mjtObj.mjOBJ_BODY, so["name"])
+            if bid >= 0:
+                self.tracked[so["name"]] = (self.data.xpos[bid], self.data.xquat[bid])
+
+    def _scene_payload(self) -> bytes:
+        return msgpack.packb(
+            {"config": self._sim_scene.config, "objects": self._flat}, use_bin_type=True
+        )
 
     async def _connect(self):
         return await websockets.connect(
@@ -165,27 +175,59 @@ class QuestPublisher:
         payload = msgpack.packb({"data": state}, use_bin_type=True)
         self._run(self._send("poses", payload))
 
-    def refresh(self, env) -> None:
-        """Re-bind to env's fresh mj_model/mj_data after a hard reset and resend the scene.
+    @staticmethod
+    def _structure_fingerprint(model) -> tuple:
+        body_names = tuple(
+            mj_id2name(model, mjtObj.mjOBJ_BODY, i) for i in range(model.nbody)
+        )
+        return (model.nbody, model.ngeom, model.nmesh, model.nq, body_names)
+
+    def rebind(self, env) -> None:
+        """Re-bind to env's fresh mj_model/mj_data after a hard reset, no network I/O.
 
         robosuite's default ``hard_reset=True`` on ``env.reset()`` replaces
         ``env.sim`` (and thus the raw mj_model/mj_data) on every reset,
-        orphaning the numpy views grabbed at construction time.  Call this
-        right after ``env.reset()`` to restore a working state.
+        orphaning the numpy views grabbed at construction time.  Use this
+        when scene structure is known to be unchanged — the next
+        ``publish_state()`` will paint the new poses.
         """
         self.model = env.sim.model._model
         self.data = env.sim.data._data
+        self._rebuild_tracked()
 
-        self.tracked = {}
-        for so in self._flat:
-            bid = mj_name2id(self.model, mjtObj.mjOBJ_BODY, so["name"])
-            if bid >= 0:
-                self.tracked[so["name"]] = (self.data.xpos[bid], self.data.xquat[bid])
+    def refresh(self, env, force: bool = False) -> None:
+        """Resync after ``env.reset()``.
 
-        scene_payload = msgpack.packb(
-            {"config": self._sim_scene.config, "objects": self._flat}, use_bin_type=True
-        )
-        self._run(self._send("scene", scene_payload))
+        With ``force=False`` (default), if the new env's scene structure
+        matches the one captured at construction, only re-bind numpy views
+        — no scene resend, no Unity-side rebuild, no visible flash.  If the
+        structure changed, fall back to a full rebind + scene resend with a
+        warning.
+
+        With ``force=True``, always do the full rebind + scene resend.
+        Use as an explicit escape hatch.
+        """
+        self.model = env.sim.model._model
+        self.data = env.sim.data._data
+        new_fp = self._structure_fingerprint(self.model)
+
+        if not force:
+            if new_fp == self._structure_fp:
+                self._rebuild_tracked()
+                logger.info(
+                    "Scene structure unchanged; rebinding only, reusing existing Quest scene."
+                )
+                return
+            logger.warning(
+                "Scene structure changed across reset; falling back to full scene resend."
+            )
+        else:
+            logger.info("Force-refreshing Quest scene.")
+
+        self._parse_scene()
+        self._rebuild_tracked()
+        self._structure_fp = new_fp
+        self._run(self._send("scene", self._scene_payload()))
 
     def close(self):
         async def _close():
