@@ -16,6 +16,13 @@ _LATCHED_BUTTONS = ("A", "B", "X", "Y")
 _LATCHED_PER_HAND = ("thumbstick_click",)
 
 
+def _connection_closed_details(exc: websockets.ConnectionClosed) -> tuple:
+    close = exc.rcvd or exc.sent
+    code = getattr(close, "code", None)
+    reason = getattr(close, "reason", "")
+    return code, reason, type(exc).__name__, str(exc)
+
+
 class QuestPublisher:
     """Persistent WebSocket; sends scene + per-step poses, receives controller input.
 
@@ -88,7 +95,25 @@ class QuestPublisher:
 
     async def _send(self, msg_type: str, data: bytes):
         envelope = msgpack.packb({"type": msg_type, "data": data}, use_bin_type=True)
-        await self._ws.send(envelope)
+        try:
+            await self._ws.send(envelope)
+        except websockets.ConnectionClosed as exc:
+            code, reason, exc_type, detail = _connection_closed_details(exc)
+            logger.warning(
+                "Quest websocket send failed for msg_type=%r: code=%s reason=%r type=%s detail=%s",
+                msg_type,
+                code,
+                reason,
+                exc_type,
+                detail,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "Quest websocket send failed for msg_type=%r",
+                msg_type,
+            )
+            raise
 
     async def _recv_loop(self):
         try:
@@ -101,8 +126,15 @@ class QuestPublisher:
                     continue
                 payload = msgpack.unpackb(envelope["data"], raw=False)
                 self._apply_input(payload)
-        except websockets.ConnectionClosed:
-            pass
+        except websockets.ConnectionClosed as exc:
+            code, reason, exc_type, detail = _connection_closed_details(exc)
+            logger.warning(
+                "Quest websocket receive loop closed: code=%s reason=%r type=%s detail=%s",
+                code,
+                reason,
+                exc_type,
+                detail,
+            )
 
     def _apply_input(self, payload):
         with self._input_lock:
