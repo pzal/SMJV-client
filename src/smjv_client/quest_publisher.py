@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 
 PORT = 8765
 
-_LATCHED_BUTTONS = ("A", "B", "X", "Y")
-_LATCHED_PER_HAND = ("thumbstick_click",)
+_LATCHED_PER_HAND = ("a", "b", "x", "y", "thumbstick_click")
 
 
 def _connection_closed_details(exc: websockets.ConnectionClosed) -> tuple:
@@ -42,6 +41,10 @@ class QuestPublisher:
 
         self._latest_input = None
         self._input_lock = threading.Lock()
+        # Latched booleans use False->True edge detection so a held button
+        # produces only one rising edge per physical press, even if the host
+        # consumes input multiple times while the button is still down.
+        self._pending: dict[str, set[str]] = {"left": set(), "right": set()}
 
         # Asyncio loop on a background thread; outbound publishes and inbound
         # recv share the same socket without blocking each other.
@@ -138,28 +141,26 @@ class QuestPublisher:
 
     def _apply_input(self, payload):
         with self._input_lock:
-            if self._latest_input is None:
-                # First frame: take it as-is so analog values seed correctly.
-                self._latest_input = payload
-                return
-            cur = self._latest_input
-            for k in _LATCHED_BUTTONS:
-                cur[k] = bool(cur.get(k, False)) or bool(payload.get(k, False))
+            # Detect False->True edges for latched buttons against the last raw
+            # value seen on the wire, so a held button doesn't re-trigger after
+            # consume_latest_input().
+            prev = self._latest_input or {}
             for hand in ("left", "right"):
-                cur_hand = cur.setdefault(hand, {})
                 new_hand = payload.get(hand, {})
-                for k, v in new_hand.items():
-                    if k in _LATCHED_PER_HAND:
-                        cur_hand[k] = bool(cur_hand.get(k, False)) or bool(v)
-                    else:
-                        cur_hand[k] = v
+                prev_hand = prev.get(hand, {})
+                for k in _LATCHED_PER_HAND:
+                    if new_hand.get(k) and not prev_hand.get(k):
+                        self._pending[hand].add(k)
+
+            self._latest_input = payload
 
     def consume_latest_input(self):
         """Return a snapshot of the latest input and clear all latched booleans.
 
         Returns None if no input frame has arrived yet. Analog values (poses,
-        triggers, thumbsticks) reflect the latest sample; booleans (A/B/X/Y,
-        thumbstick_click) are True if pressed in any frame since the last call.
+        triggers, thumbsticks) reflect the latest sample; per-hand latched
+        booleans (a, b on right; x, y on left; thumbstick_click on both) are
+        True if pressed in any frame since the last call.
 
         ``rot`` on each hand is returned as ``[x, y, z, w]`` (scipy convention)
         — the Unity app sends ``[w, x, y, z]`` which is reordered here so
@@ -169,15 +170,17 @@ class QuestPublisher:
             if self._latest_input is None:
                 return None
             snapshot = deepcopy(self._latest_input)
-            for k in _LATCHED_BUTTONS:
-                self._latest_input[k] = False
+            # Latched booleans reflect rising edges since the last consume,
+            # not the current raw wire value, so a held button only fires once.
             for hand in ("left", "right"):
-                hand_dict = self._latest_input.get(hand)
-                if hand_dict is None:
+                hand_snap = snapshot.get(hand)
+                if hand_snap is None:
                     continue
+                pending = self._pending[hand]
                 for k in _LATCHED_PER_HAND:
-                    if k in hand_dict:
-                        hand_dict[k] = False
+                    if k in hand_snap:
+                        hand_snap[k] = k in pending
+                pending.clear()
             # Unity wire format: rot = [w, x, y, z].  Reorder to scipy [x, y, z, w].
             for hand in ("left", "right"):
                 hand_snap = snapshot.get(hand)
