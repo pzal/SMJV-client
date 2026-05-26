@@ -67,6 +67,14 @@ class QuestPublisher:
 
     def _parse_scene(self) -> None:
         sim_scene = MjModelParser(self.model, visible_geoms_groups=[1]).parse()
+        # MjModelParser emits a node for every body, including unnamed ones
+        # (e.g. the anonymous wrapper body that robosuite XMLObjects nest their
+        # named "object" body inside). Such nodes are unaddressable downstream
+        # — no key for per-frame pose updates, no name for Unity to reference —
+        # so we splice them out: lift their visuals into the parent, reparent
+        # their children to the grandparent, and drop the node.
+        self._splice_anonymous_bodies(sim_scene.root)
+
         flat = []
 
         def walk(node):
@@ -78,6 +86,66 @@ class QuestPublisher:
         walk(sim_scene.root)
         self._sim_scene = sim_scene
         self._flat = flat
+
+    @staticmethod
+    def _compose_transforms(outer, inner):
+        """Return outer * inner (Unity convention: pos=[x,y,z], rot=[x,y,z,w])."""
+        ox, oy, oz = outer["pos"]
+        qx, qy, qz, qw = outer["rot"]
+        ix, iy, iz = inner["pos"]
+        # Rotate inner position by outer quaternion.
+        tx = 2.0 * (qy * iz - qz * iy)
+        ty = 2.0 * (qz * ix - qx * iz)
+        tz = 2.0 * (qx * iy - qy * ix)
+        rx = ix + qw * tx + (qy * tz - qz * ty)
+        ry = iy + qw * ty + (qz * tx - qx * tz)
+        rz = iz + qw * tz + (qx * ty - qy * tx)
+        new_pos = [ox + rx, oy + ry, oz + rz]
+        # Hamilton quaternion product outer * inner.
+        ax, ay, az, aw = inner["rot"]
+        new_rot = [
+            qw * ax + qx * aw + qy * az - qz * ay,
+            qw * ay - qx * az + qy * aw + qz * ax,
+            qw * az + qx * ay - qy * ax + qz * aw,
+            qw * aw - qx * ax - qy * ay - qz * az,
+        ]
+        new_scale = [outer["scale"][i] * inner["scale"][i] for i in range(3)]
+        return {"pos": new_pos, "rot": new_rot, "scale": new_scale}
+
+    def _splice_anonymous_bodies(self, node) -> None:
+        """Remove unnamed bodies from the tree, lifting their content into the parent.
+
+        Visuals and children of an anonymous body get their local transforms
+        composed with the body's own transform, then are reattached to the
+        grandparent. Post-order so nested anonymous bodies collapse cleanly.
+        """
+        for child in node.children:
+            self._splice_anonymous_bodies(child)
+
+        new_children = []
+        for child in node.children:
+            if child.data is None or child.data.get("name") is not None:
+                new_children.append(child)
+                continue
+
+            anon_trans = child.data["trans"]
+            if node.data is not None:
+                for visual in child.data.get("visuals", []):
+                    visual["trans"] = self._compose_transforms(
+                        anon_trans, visual["trans"]
+                    )
+                    node.data["visuals"].append(visual)
+
+            new_parent_name = node.data["name"] if node.data is not None else "root"
+            for grandchild in child.children:
+                if grandchild.data is not None:
+                    grandchild.data["trans"] = self._compose_transforms(
+                        anon_trans, grandchild.data["trans"]
+                    )
+                    grandchild.data["parent"] = new_parent_name
+                new_children.append(grandchild)
+
+        node.children = new_children
 
     def _rebuild_tracked(self) -> None:
         self.tracked = {}
