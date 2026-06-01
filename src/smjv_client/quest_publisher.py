@@ -15,6 +15,17 @@ PORT = 8765
 
 _LATCHED_PER_HAND = ("a", "b", "x", "y", "thumbstick_click")
 
+# Reconnect backoff bounds (seconds).
+_INITIAL_BACKOFF = 0.5
+_MAX_BACKOFF = 10.0
+
+# websockets defaults can take tens of seconds to detect a dead link. Keep
+# this short enough for VR recording, but not so short that brief Wi-Fi jitter
+# causes avoidable reconnects.
+_PING_INTERVAL = 2.0
+_PING_TIMEOUT = 2.0
+_CLOSE_TIMEOUT = 1.0
+
 
 def _connection_closed_details(exc: websockets.ConnectionClosed) -> tuple:
     close = exc.rcvd or exc.sent
@@ -47,19 +58,37 @@ class QuestPublisher:
         # consumes input multiple times while the button is still down.
         self._pending: dict[str, set[str]] = {"left": set(), "right": set()}
 
+        # Set while a live socket is usable; cleared the moment a drop is
+        # detected (by either the send or recv side). threading.Event so the
+        # caller thread can poll is_connected() cheaply, without touching the
+        # loop thread.
+        self._connected = threading.Event()
+        self._closing = False
+
         # Asyncio loop on a background thread; outbound publishes and inbound
         # recv share the same socket without blocking each other.
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._loop_thread.start()
 
-        self._ws = self._run(self._connect())
-        self._run(self._send("scene", self._scene_payload()))
+        # Initial connect stays synchronous so construction fails loudly if the
+        # Quest is unreachable at startup.
+        try:
+            self._ws = self._run(self._connect())
+            self._run(self._send_raw("scene", self._scene_payload()))
+        except Exception:
+            self._closing = True
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=2)
+            raise
+        self._connected.set()
 
-        # Long-running coroutine: schedule and keep the Future for later cancel,
-        # but DO NOT call .result() — that would block this thread forever.
-        self._recv_task = asyncio.run_coroutine_threadsafe(
-            self._recv_loop(), self._loop
+        # Long-running supervisor: runs the recv loop and, when the socket
+        # drops, reconnects (forever, with backoff) and resends the scene.
+        # Schedule and keep the Future for later cancel, but DO NOT call
+        # .result() — that would block this thread forever.
+        self._supervisor_task = asyncio.run_coroutine_threadsafe(
+            self._supervise(), self._loop
         )
 
     def _run(self, coro):
@@ -191,13 +220,25 @@ class QuestPublisher:
 
     async def _connect(self):
         return await websockets.connect(
-            f"ws://{self.quest_ip}:{self.quest_port}/sim", max_size=64 * 1024 * 1024
+            f"ws://{self.quest_ip}:{self.quest_port}/sim",
+            max_size=64 * 1024 * 1024,
+            ping_interval=_PING_INTERVAL,
+            ping_timeout=_PING_TIMEOUT,
+            close_timeout=_CLOSE_TIMEOUT,
         )
 
-    async def _send(self, msg_type: str, data: bytes):
+    async def _send_raw(self, msg_type: str, data: bytes):
+        """Send on the current socket, propagating any failure to the caller.
+
+        Used by the reconnect path, which must know whether the scene resend on
+        a fresh socket actually succeeded.
+        """
         envelope = msgpack.packb({"type": msg_type, "data": data}, use_bin_type=True)
+        await self._ws.send(envelope)
+
+    async def _send(self, msg_type: str, data: bytes):
         try:
-            await self._ws.send(envelope)
+            await self._send_raw(msg_type, data)
         except websockets.ConnectionClosed as exc:
             code, reason, exc_type, detail = _connection_closed_details(exc)
             logger.warning(
@@ -208,13 +249,33 @@ class QuestPublisher:
                 exc_type,
                 detail,
             )
-            raise
+            # Non-fatal: flag the drop and swallow. The supervisor (driven by
+            # the recv loop ending) owns reconnection; raising here would crash
+            # the caller's recording loop.
+            await self._drop_connection()
         except Exception:
             logger.exception(
                 "Quest websocket send failed for msg_type=%r",
                 msg_type,
             )
-            raise
+            await self._drop_connection()
+
+    def _clear_input_state(self) -> None:
+        with self._input_lock:
+            self._latest_input = None
+            for pending in self._pending.values():
+                pending.clear()
+
+    def _mark_disconnected(self) -> None:
+        self._connected.clear()
+        self._clear_input_state()
+
+    async def _drop_connection(self) -> None:
+        self._mark_disconnected()
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
 
     async def _recv_loop(self):
         try:
@@ -236,6 +297,54 @@ class QuestPublisher:
                 exc_type,
                 detail,
             )
+        except Exception:
+            logger.exception("Quest websocket receive loop errored.")
+
+    async def _supervise(self):
+        """Own the connection lifecycle for the life of the publisher.
+
+        Run the recv loop; when it returns (socket dropped), mark disconnected
+        and reconnect with backoff. Reconnection lives here alone so that
+        send-side and recv-side drops don't race two reconnect attempts.
+        """
+        while not self._closing:
+            await self._recv_loop()
+            if self._closing:
+                break
+            self._mark_disconnected()
+            logger.warning("Quest connection lost; reconnecting…")
+            await self._reconnect()
+
+    async def _reconnect(self):
+        """Reconnect forever with capped exponential backoff, then resend scene."""
+        backoff = _INITIAL_BACKOFF
+        while not self._closing:
+            try:
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                self._ws = await self._connect()
+                # Resend the current scene so a freshly (re)started Quest app
+                # rebuilds it; refresh() keeps self._flat/_sim_scene current.
+                # _send_raw so a failed resend retries instead of being
+                # swallowed and falsely marked connected.
+                await self._send_raw("scene", self._scene_payload())
+                self._clear_input_state()
+                self._connected.set()
+                logger.info("Quest reconnected; scene resent.")
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Quest reconnect attempt failed: %s; retrying in %.1fs",
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
 
     def _apply_input(self, payload):
         with self._input_lock:
@@ -288,12 +397,18 @@ class QuestPublisher:
             return snapshot
 
     def send_display(self, value, label: str = ""):
+        if not self._connected.is_set():
+            return
         payload = msgpack.packb(
             {"label": label, "value": str(value)}, use_bin_type=True
         )
         self._run(self._send("display", payload))
 
     def publish_state(self):
+        # No-op while disconnected: skip the loop-thread round-trip entirely so
+        # the caller's loop stays cheap (~20 Hz) until the supervisor reconnects.
+        if not self._connected.is_set():
+            return
         state = {}
         for name, (p, q) in self.tracked.items():
             state[name] = [
@@ -360,9 +475,15 @@ class QuestPublisher:
         self._parse_scene()
         self._rebuild_tracked()
         self._structure_fp = new_fp
-        self._run(self._send("scene", self._scene_payload()))
+        # Only hit the network if connected; otherwise the supervisor's
+        # reconnect will resend this now-current scene once the socket is back.
+        if self._connected.is_set():
+            self._run(self._send("scene", self._scene_payload()))
 
     def close(self):
+        # Stop the supervisor from reconnecting once we start tearing down.
+        self._closing = True
+
         async def _close():
             try:
                 await self._send("clear", b"")
@@ -371,7 +492,7 @@ class QuestPublisher:
             await self._ws.close()
 
         try:
-            self._recv_task.cancel()
+            self._supervisor_task.cancel()
         except Exception:
             pass
         try:
