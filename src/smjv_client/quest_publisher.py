@@ -4,6 +4,7 @@ import threading
 from copy import deepcopy
 
 import msgpack
+import numpy as np
 import websockets
 from mujoco import mj_id2name, mj_name2id, mjtObj
 from simpub.parser.mj import MjModelParser
@@ -86,6 +87,35 @@ class QuestPublisher:
         walk(sim_scene.root)
         self._sim_scene = sim_scene
         self._flat = flat
+        self._align_mesh_orientation()
+
+    @staticmethod
+    def _align_mesh_buf(buf: bytes) -> bytes:
+        arr = np.frombuffer(buf, dtype=np.float32).reshape(-1, 3).copy()
+        arr[:, 0] = -arr[:, 0]  # undo the spurious 180° spin about Unity up:
+        arr[:, 2] = -arr[:, 2]  # negate Unity x and z
+        return arr.tobytes()
+
+    def _align_mesh_orientation(self) -> None:
+        """Re-align mesh-local geometry to this stack's mj2unity convention.
+
+        simpub's create_mesh encodes mesh vertices/normals with the IsaacSim
+        remap [x,y,z]->[y,z,-x], but bodies/geoms here are placed and streamed
+        with mj2unity [x,y,z]->[-y,z,x] (process_body/process_geoms and
+        publish_state). The two differ by a 180° rotation about Unity's up
+        axis, so mesh assets spawn rotated relative to their transforms. Undo
+        that spin on the mesh-local vertices and normals (negate Unity x and
+        z). Indices/winding are unaffected — the correction is a proper
+        rotation (det +1).
+        """
+        for so in self._flat:
+            for visual in so.get("visuals", []):
+                mesh = visual.get("mesh")
+                if mesh is None:
+                    continue
+                mesh["vertices"] = self._align_mesh_buf(mesh["vertices"])
+                if mesh.get("normals") is not None:
+                    mesh["normals"] = self._align_mesh_buf(mesh["normals"])
 
     @staticmethod
     def _compose_transforms(outer, inner):
