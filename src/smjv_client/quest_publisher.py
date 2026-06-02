@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import logging
 import threading
 from copy import deepcopy
 
 import msgpack
+import mujoco
 import numpy as np
 import websockets
 from mujoco import mj_id2name, mj_name2id, mjtObj
@@ -41,15 +43,18 @@ class QuestPublisher:
     inbound recv task share the same socket without blocking each other.
     """
 
-    def __init__(self, env, quest_ip, quest_port=PORT, visible_geoms_groups=range(5)):
+    def __init__(self, env, quest_ip, quest_port=PORT, visible_geoms_groups=(1,)):
         self.model = env.sim.model._model
         self.data = env.sim.data._data
         self.quest_ip = quest_ip
         self.quest_port = quest_port
+        self.visible_geoms_groups = tuple(int(group) for group in visible_geoms_groups)
 
         self._parse_scene()
         self._rebuild_tracked()
-        self._structure_fp = self._structure_fingerprint(self.model)
+        self._structure_fp = self._structure_fingerprint(
+            self.model, self.visible_geoms_groups
+        )
 
         self._latest_input = None
         self._input_lock = threading.Lock()
@@ -96,7 +101,9 @@ class QuestPublisher:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     def _parse_scene(self) -> None:
-        sim_scene = MjModelParser(self.model, visible_geoms_groups=[1]).parse()
+        sim_scene = MjModelParser(
+            self.model, visible_geoms_groups=self.visible_geoms_groups
+        ).parse()
         # MjModelParser emits a node for every body, including unnamed ones
         # (e.g. the anonymous wrapper body that robosuite XMLObjects nest their
         # named "object" body inside). Such nodes are unaddressable downstream
@@ -423,12 +430,148 @@ class QuestPublisher:
         payload = msgpack.packb({"data": state}, use_bin_type=True)
         self._run(self._send("poses", payload))
 
-    @staticmethod
-    def _structure_fingerprint(model) -> tuple:
+    @classmethod
+    def _structure_fingerprint(cls, model, visible_geoms_groups=(1,)) -> tuple:
+        """Fingerprint the rendered scene content that Unity caches.
+
+        A robosuite hard reset can swap the XML object while keeping the same
+        body names and counts. In that case rebinding poses is not enough:
+        Unity must receive a new scene because mesh/material/texture data may
+        have changed.
+        """
+        visible_groups = frozenset(int(group) for group in visible_geoms_groups)
         body_names = tuple(
             mj_id2name(model, mjtObj.mjOBJ_BODY, i) for i in range(model.nbody)
         )
-        return (model.nbody, model.ngeom, model.nmesh, model.nq, body_names)
+        body_layout = tuple(
+            (
+                body_names[i],
+                int(model.body_parentid[i]),
+                int(model.body_geomadr[i]),
+                int(model.body_geomnum[i]),
+            )
+            for i in range(model.nbody)
+        )
+        rendered_geoms = tuple(
+            cls._geom_fingerprint(model, geom_id)
+            for geom_id in range(model.ngeom)
+            if int(model.geom_group[geom_id]) in visible_groups
+        )
+        return (
+            int(model.nbody),
+            int(model.ngeom),
+            int(model.nmesh),
+            int(getattr(model, "nmat", 0)),
+            int(getattr(model, "ntex", 0)),
+            int(model.nq),
+            body_layout,
+            rendered_geoms,
+        )
+
+    @classmethod
+    def _geom_fingerprint(cls, model, geom_id: int) -> tuple:
+        geom_type = int(model.geom_type[geom_id])
+        mesh_fp = None
+        if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
+            mesh_fp = cls._mesh_fingerprint(model, int(model.geom_dataid[geom_id]))
+
+        mat_fp = None
+        mat_id = int(model.geom_matid[geom_id])
+        if mat_id != -1:
+            mat_fp = cls._material_fingerprint(model, mat_id)
+
+        return (
+            mj_id2name(model, mjtObj.mjOBJ_GEOM, geom_id),
+            int(model.geom_bodyid[geom_id]),
+            geom_type,
+            int(model.geom_group[geom_id]),
+            cls._array_digest(model.geom_pos[geom_id]),
+            cls._array_digest(model.geom_quat[geom_id]),
+            cls._array_digest(model.geom_size[geom_id]),
+            cls._array_digest(model.geom_rgba[geom_id]),
+            mesh_fp,
+            mat_fp,
+        )
+
+    @classmethod
+    def _mesh_fingerprint(cls, model, mesh_id: int) -> tuple:
+        vert_adr = int(model.mesh_vertadr[mesh_id])
+        vert_num = int(model.mesh_vertnum[mesh_id])
+        face_adr = int(model.mesh_faceadr[mesh_id])
+        face_num = int(model.mesh_facenum[mesh_id])
+        texcoord_adr = int(model.mesh_texcoordadr[mesh_id])
+        texcoord_num = int(model.mesh_texcoordnum[mesh_id])
+
+        texcoords = None
+        face_texcoords = None
+        if texcoord_adr != -1:
+            texcoords = model.mesh_texcoord[texcoord_adr : texcoord_adr + texcoord_num]
+            face_texcoords = model.mesh_facetexcoord[face_adr : face_adr + face_num]
+
+        return (
+            mj_id2name(model, mjtObj.mjOBJ_MESH, mesh_id),
+            vert_num,
+            face_num,
+            texcoord_num,
+            cls._array_digest(model.mesh_vert[vert_adr : vert_adr + vert_num]),
+            cls._array_digest(model.mesh_face[face_adr : face_adr + face_num]),
+            cls._array_digest(texcoords),
+            cls._array_digest(face_texcoords),
+        )
+
+    @classmethod
+    def _material_fingerprint(cls, model, mat_id: int) -> tuple:
+        tex_id = cls._material_rgb_texture_id(model, mat_id)
+        texture_fp = None
+        if tex_id != -1:
+            texture_fp = cls._texture_fingerprint(model, tex_id)
+
+        return (
+            mj_id2name(model, mjtObj.mjOBJ_MATERIAL, mat_id),
+            cls._array_digest(model.mat_rgba[mat_id]),
+            float(model.mat_specular[mat_id]),
+            float(model.mat_shininess[mat_id]),
+            float(model.mat_reflectance[mat_id]),
+            cls._array_digest(model.mat_texrepeat[mat_id]),
+            texture_fp,
+        )
+
+    @staticmethod
+    def _material_rgb_texture_id(model, mat_id: int) -> int:
+        tex_id = model.mat_texid[mat_id]
+        if isinstance(tex_id, np.ndarray):
+            return int(tex_id[1])
+        return int(tex_id)
+
+    @classmethod
+    def _texture_fingerprint(cls, model, tex_id: int) -> tuple:
+        height = int(model.tex_height[tex_id])
+        width = int(model.tex_width[tex_id])
+        nchannel = (
+            int(model.tex_nchannel[tex_id]) if hasattr(model, "tex_nchannel") else 3
+        )
+        tex_adr = int(model.tex_adr[tex_id])
+        tex_num = height * width * nchannel
+        tex_data = model.tex_data if hasattr(model, "tex_data") else model.tex_rgb
+
+        return (
+            mj_id2name(model, mjtObj.mjOBJ_TEXTURE, tex_id),
+            height,
+            width,
+            nchannel,
+            cls._array_digest(tex_data[tex_adr : tex_adr + tex_num]),
+        )
+
+    @staticmethod
+    def _array_digest(array) -> bytes | None:
+        if array is None:
+            return None
+        arr = np.asarray(array)
+        hasher = hashlib.blake2b(digest_size=16)
+        hasher.update(str(arr.dtype).encode("ascii"))
+        hasher.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        hasher.update(np.ascontiguousarray(arr).tobytes())
+        return hasher.digest()
 
     def rebind(self, env) -> None:
         """Re-bind to env's fresh mj_model/mj_data after a hard reset, no network I/O.
@@ -436,7 +579,7 @@ class QuestPublisher:
         robosuite's default ``hard_reset=True`` on ``env.reset()`` replaces
         ``env.sim`` (and thus the raw mj_model/mj_data) on every reset,
         orphaning the numpy views grabbed at construction time.  Use this
-        when scene structure is known to be unchanged — the next
+        when scene content is known to be unchanged — the next
         ``publish_state()`` will paint the new poses.
         """
         self.model = env.sim.model._model
@@ -446,10 +589,10 @@ class QuestPublisher:
     def refresh(self, env, force: bool = False) -> None:
         """Resync after ``env.reset()``.
 
-        With ``force=False`` (default), if the new env's scene structure
+        With ``force=False`` (default), if the new env's rendered scene content
         matches the one captured at construction, only re-bind numpy views
         — no scene resend, no Unity-side rebuild, no visible flash.  If the
-        structure changed, fall back to a full rebind + scene resend with a
+        content changed, fall back to a full rebind + scene resend with a
         warning.
 
         With ``force=True``, always do the full rebind + scene resend.
@@ -457,17 +600,17 @@ class QuestPublisher:
         """
         self.model = env.sim.model._model
         self.data = env.sim.data._data
-        new_fp = self._structure_fingerprint(self.model)
+        new_fp = self._structure_fingerprint(self.model, self.visible_geoms_groups)
 
         if not force:
             if new_fp == self._structure_fp:
                 self._rebuild_tracked()
                 logger.info(
-                    "Scene structure unchanged; rebinding only, reusing existing Quest scene."
+                    "Scene content unchanged; rebinding only, reusing existing Quest scene."
                 )
                 return
             logger.warning(
-                "Scene structure changed across reset; falling back to full scene resend."
+                "Scene content changed across reset; falling back to full scene resend."
             )
         else:
             logger.info("Force-refreshing Quest scene.")
