@@ -26,6 +26,8 @@ from simpub.parser.simdata import (
 
 logger = logging.getLogger(__name__)
 
+_ALPHA_EPSILON = 1e-6
+
 
 class MjSceneParser:
     def __init__(self, model, visible_geoms_groups, no_rendered_objects=None):
@@ -79,6 +81,9 @@ class MjSceneParser:
             for geom_id in range(adr, adr + int(model.body_geomnum[body_id])):
                 if int(model.geom_group[geom_id]) not in self.visible_geoms_groups:
                     continue
+                geom_name = mj_id2name(model, mjtObj.mjOBJ_GEOM, geom_id)
+                if not self._is_renderable_geom(model, geom_id, geom_name):
+                    continue
                 visual = self._process_geom(model, geom_id)
                 if visual["name"] is None:
                     visual["name"] = f"{body_name}_geom_{geom_id}"
@@ -112,6 +117,25 @@ class MjSceneParser:
         return SimVisual(
             name=geom_name, type=visual_type, mesh=mesh, material=material, trans=trans
         )
+
+    @classmethod
+    def _is_renderable_geom(cls, model, geom_id: int, geom_name: str | None) -> bool:
+        if cls._is_region_marker_geom(geom_name):
+            return False
+        return cls._geom_alpha(model, geom_id) > _ALPHA_EPSILON
+
+    @staticmethod
+    def _is_region_marker_geom(geom_name: str | None) -> bool:
+        if geom_name is None:
+            return False
+        return geom_name == "reg_bbox" or geom_name.endswith("_reg_bbox")
+
+    @staticmethod
+    def _geom_alpha(model, geom_id: int) -> float:
+        mat_id = int(model.geom_matid[geom_id])
+        if mat_id != -1:
+            return float(model.mat_rgba[mat_id][3])
+        return float(model.geom_rgba[geom_id][3])
 
     def _process_mesh(self, model, mesh_id: int) -> SimMesh:
         vert_adr = int(model.mesh_vertadr[mesh_id])

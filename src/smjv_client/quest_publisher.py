@@ -5,10 +5,8 @@ import threading
 from copy import deepcopy
 
 import msgpack
-import mujoco
-import numpy as np
 import websockets
-from mujoco import mj_id2name, mj_name2id, mjtObj
+from mujoco import mj_name2id, mjtObj
 
 from .mj_parser import MjSceneParser
 
@@ -28,6 +26,8 @@ _MAX_BACKOFF = 10.0
 _PING_INTERVAL = 2.0
 _PING_TIMEOUT = 2.0
 _CLOSE_TIMEOUT = 1.0
+
+_ASSET_KINDS = ("meshes", "textures", "materials")
 
 
 def _connection_closed_details(exc: websockets.ConnectionClosed) -> tuple:
@@ -53,9 +53,8 @@ class QuestPublisher:
 
         self._parse_scene()
         self._rebuild_tracked()
-        self._structure_fp = self._structure_fingerprint(
-            self.model, self.visible_geoms_groups
-        )
+        self._asset_store = self._empty_asset_store()
+        self._scene_hash = None
 
         self._latest_input = None
         self._input_lock = threading.Lock()
@@ -81,7 +80,7 @@ class QuestPublisher:
         # Quest is unreachable at startup.
         try:
             self._ws = self._run(self._connect())
-            self._run(self._send_raw("scene", self._scene_payload()))
+            self._run(self._send_scene_manifest_raw())
         except Exception:
             self._closing = True
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -199,6 +198,194 @@ class QuestPublisher:
             {"config": self._sim_scene.config, "objects": self._flat}, use_bin_type=True
         )
 
+    @staticmethod
+    def _empty_asset_store() -> dict[str, dict[str, dict]]:
+        return {kind: {} for kind in _ASSET_KINDS}
+
+    @staticmethod
+    def _stable_hash(value) -> str:
+        packed = msgpack.packb(value, use_bin_type=True)
+        return hashlib.sha256(packed).hexdigest()
+
+    @classmethod
+    def _build_scene_manifest_document(
+        cls,
+        config,
+        objects,
+    ) -> tuple[dict, dict[str, dict[str, dict]]]:
+        """Return a hash-only scene manifest plus a local asset lookup table."""
+        assets = cls._empty_asset_store()
+        manifest_objects = []
+
+        for obj in objects:
+            manifest_obj = deepcopy(obj)
+            cls._replace_visual_assets_with_refs(
+                manifest_obj,
+                assets,
+            )
+            manifest_obj["contentHash"] = cls._object_content_hash(manifest_obj)
+            manifest_objects.append(manifest_obj)
+
+        scene_hash = cls._stable_hash(
+            {
+                "version": 2,
+                "config": config,
+                "objects": manifest_objects,
+            }
+        )
+        return (
+            {
+                "version": 2,
+                "config": config,
+                "objects": manifest_objects,
+                "sceneHash": scene_hash,
+            },
+            assets,
+        )
+
+    @classmethod
+    def _replace_visual_assets_with_refs(
+        cls,
+        obj,
+        assets: dict[str, dict],
+    ) -> None:
+        for visual in obj.get("visuals") or []:
+            mesh = visual.get("mesh")
+            if mesh is not None:
+                mesh_hash = cls._mesh_hash(mesh)
+                mesh_asset = deepcopy(mesh)
+                mesh_asset["hash"] = mesh_hash
+                assets["meshes"][mesh_hash] = mesh_asset
+                visual["mesh"] = {"hash": mesh_hash}
+
+            material = visual.get("material")
+            if material is not None:
+                material_hash, material_asset, material_ref = cls._material_hash_and_asset(
+                    material,
+                    assets,
+                )
+                assets["materials"][material_hash] = material_asset
+                visual["material"] = material_ref
+
+    @classmethod
+    def _mesh_hash(cls, mesh) -> str:
+        return cls._stable_hash(
+            {
+                "indices": mesh.get("indices"),
+                "vertices": mesh.get("vertices"),
+                "normals": mesh.get("normals"),
+                "uv": mesh.get("uv"),
+            }
+        )
+
+    @classmethod
+    def _texture_hash_and_asset(cls, texture) -> tuple[str, dict]:
+        texture_hash = cls._stable_hash(
+            {
+                "width": texture.get("width"),
+                "height": texture.get("height"),
+                "textureType": texture.get("textureType"),
+                "textureScale": texture.get("textureScale"),
+                "textureData": texture.get("textureData"),
+            }
+        )
+        texture_asset = deepcopy(texture)
+        texture_asset["hash"] = texture_hash
+        return texture_hash, texture_asset
+
+    @classmethod
+    def _material_hash_and_asset(
+        cls,
+        material,
+        assets: dict[str, dict],
+    ) -> tuple[str, dict, dict]:
+        texture = material.get("texture")
+        texture_ref = None
+        if texture is not None:
+            texture_hash, texture_asset = cls._texture_hash_and_asset(texture)
+            assets["textures"][texture_hash] = texture_asset
+            texture_ref = {"hash": texture_hash}
+
+        material_for_hash = {
+            "color": material.get("color"),
+            "emissionColor": material.get("emissionColor"),
+            "specular": material.get("specular"),
+            "shininess": material.get("shininess"),
+            "reflectance": material.get("reflectance"),
+            "texture": texture_ref,
+        }
+        material_hash = cls._stable_hash(material_for_hash)
+        material_asset = deepcopy(material)
+        material_asset["hash"] = material_hash
+        material_asset["texture"] = texture_ref
+        material_ref = {"hash": material_hash}
+        if texture_ref is not None:
+            material_ref["texture"] = texture_ref
+        return material_hash, material_asset, material_ref
+
+    @classmethod
+    def _object_content_hash(cls, obj) -> str:
+        visuals = []
+        for visual in obj.get("visuals") or []:
+            mesh = visual.get("mesh")
+            material = visual.get("material")
+            visuals.append(
+                {
+                    "name": visual.get("name"),
+                    "type": visual.get("type"),
+                    "trans": visual.get("trans"),
+                    "mesh": mesh.get("hash") if mesh is not None else None,
+                    "material": material.get("hash") if material is not None else None,
+                }
+            )
+        return cls._stable_hash(
+            {
+                "parent": obj.get("parent"),
+                "visuals": visuals,
+            }
+        )
+
+    def _pack_scene_manifest_payload(
+        self,
+    ) -> tuple[bytes, dict[str, dict[str, dict]], str, dict[str, int]]:
+        payload, asset_store = self._build_scene_manifest_document(
+            self._sim_scene.config,
+            self._flat,
+        )
+        asset_counts = {
+            kind: len(asset_store[kind])
+            for kind in _ASSET_KINDS
+        }
+        return (
+            msgpack.packb(payload, use_bin_type=True),
+            asset_store,
+            payload["sceneHash"],
+            asset_counts,
+        )
+
+    async def _send_scene_manifest_raw(self):
+        payload, asset_store, scene_hash, asset_counts = self._pack_scene_manifest_payload()
+        self._asset_store = asset_store
+        self._scene_hash = scene_hash
+        await self._send_raw("scene_manifest", payload)
+
+    async def _send_scene_manifest(self):
+        try:
+            await self._send_scene_manifest_raw()
+        except websockets.ConnectionClosed as exc:
+            code, reason, exc_type, detail = _connection_closed_details(exc)
+            logger.warning(
+                "Quest websocket send failed for msg_type='scene_manifest': code=%s reason=%r type=%s detail=%s",
+                code,
+                reason,
+                exc_type,
+                detail,
+            )
+            await self._drop_connection()
+        except Exception:
+            logger.exception("Quest websocket send failed for msg_type='scene_manifest'")
+            await self._drop_connection()
+
     async def _connect(self):
         return await websockets.connect(
             f"ws://{self.quest_ip}:{self.quest_port}/sim",
@@ -241,6 +428,47 @@ class QuestPublisher:
             )
             await self._drop_connection()
 
+    def _build_asset_response(self, request: dict) -> dict:
+        requested = {
+            kind: [str(asset_hash) for asset_hash in (request.get(kind) or [])]
+            for kind in _ASSET_KINDS
+        }
+        response = {
+            "version": 1,
+            "requestId": request.get("requestId"),
+            "sceneHash": request.get("sceneHash"),
+            "assets": self._empty_asset_store(),
+            "missing": {kind: [] for kind in _ASSET_KINDS},
+        }
+
+        if request.get("sceneHash") != self._scene_hash:
+            for kind in _ASSET_KINDS:
+                response["missing"][kind].extend(requested[kind])
+            logger.warning(
+                "Ignoring stale asset_request requestId=%r sceneHash=%r currentSceneHash=%r",
+                request.get("requestId"),
+                request.get("sceneHash"),
+                self._scene_hash,
+            )
+            return response
+
+        for kind in _ASSET_KINDS:
+            store = self._asset_store.get(kind, {})
+            for asset_hash in requested[kind]:
+                asset = store.get(asset_hash)
+                if asset is None:
+                    response["missing"][kind].append(asset_hash)
+                else:
+                    response["assets"][kind][asset_hash] = asset
+        return response
+
+    async def _handle_asset_request(self, payload: dict) -> None:
+        response = self._build_asset_response(payload)
+        await self._send(
+            "asset_response",
+            msgpack.packb(response, use_bin_type=True),
+        )
+
     def _clear_input_state(self) -> None:
         with self._input_lock:
             self._latest_input = None
@@ -265,10 +493,13 @@ class QuestPublisher:
                     envelope = msgpack.unpackb(msg, raw=False)
                 except Exception:
                     continue
-                if envelope.get("type") != "input":
-                    continue
-                payload = msgpack.unpackb(envelope["data"], raw=False)
-                self._apply_input(payload)
+                msg_type = envelope.get("type")
+                if msg_type == "input":
+                    payload = msgpack.unpackb(envelope["data"], raw=False)
+                    self._apply_input(payload)
+                elif msg_type == "asset_request":
+                    payload = msgpack.unpackb(envelope["data"], raw=False)
+                    await self._handle_asset_request(payload)
         except websockets.ConnectionClosed as exc:
             code, reason, exc_type, detail = _connection_closed_details(exc)
             logger.warning(
@@ -310,7 +541,7 @@ class QuestPublisher:
                 # rebuilds it; refresh() keeps self._flat/_sim_scene current.
                 # _send_raw so a failed resend retries instead of being
                 # swallowed and falsely marked connected.
-                await self._send_raw("scene", self._scene_payload())
+                await self._send_scene_manifest_raw()
                 self._clear_input_state()
                 self._connected.set()
                 logger.info("Quest reconnected; scene resent.")
@@ -404,157 +635,13 @@ class QuestPublisher:
         payload = msgpack.packb({"data": state}, use_bin_type=True)
         self._run(self._send("poses", payload))
 
-    @classmethod
-    def _structure_fingerprint(cls, model, visible_geoms_groups=(1,)) -> tuple:
-        """Fingerprint the rendered scene content that Unity caches.
-
-        A robosuite hard reset can swap the XML object while keeping the same
-        body names and counts. In that case rebinding poses is not enough:
-        Unity must receive a new scene because mesh/material/texture data may
-        have changed.
-        """
-        visible_groups = frozenset(int(group) for group in visible_geoms_groups)
-        body_names = tuple(
-            mj_id2name(model, mjtObj.mjOBJ_BODY, i) for i in range(model.nbody)
-        )
-        body_layout = tuple(
-            (
-                body_names[i],
-                int(model.body_parentid[i]),
-                int(model.body_geomadr[i]),
-                int(model.body_geomnum[i]),
-            )
-            for i in range(model.nbody)
-        )
-        rendered_geoms = tuple(
-            cls._geom_fingerprint(model, geom_id)
-            for geom_id in range(model.ngeom)
-            if int(model.geom_group[geom_id]) in visible_groups
-        )
-        return (
-            int(model.nbody),
-            int(model.ngeom),
-            int(model.nmesh),
-            int(getattr(model, "nmat", 0)),
-            int(getattr(model, "ntex", 0)),
-            int(model.nq),
-            body_layout,
-            rendered_geoms,
-        )
-
-    @classmethod
-    def _geom_fingerprint(cls, model, geom_id: int) -> tuple:
-        geom_type = int(model.geom_type[geom_id])
-        mesh_fp = None
-        if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
-            mesh_fp = cls._mesh_fingerprint(model, int(model.geom_dataid[geom_id]))
-
-        mat_fp = None
-        mat_id = int(model.geom_matid[geom_id])
-        if mat_id != -1:
-            mat_fp = cls._material_fingerprint(model, mat_id)
-
-        return (
-            mj_id2name(model, mjtObj.mjOBJ_GEOM, geom_id),
-            int(model.geom_bodyid[geom_id]),
-            geom_type,
-            int(model.geom_group[geom_id]),
-            cls._array_digest(model.geom_pos[geom_id]),
-            cls._array_digest(model.geom_quat[geom_id]),
-            cls._array_digest(model.geom_size[geom_id]),
-            cls._array_digest(model.geom_rgba[geom_id]),
-            mesh_fp,
-            mat_fp,
-        )
-
-    @classmethod
-    def _mesh_fingerprint(cls, model, mesh_id: int) -> tuple:
-        vert_adr = int(model.mesh_vertadr[mesh_id])
-        vert_num = int(model.mesh_vertnum[mesh_id])
-        face_adr = int(model.mesh_faceadr[mesh_id])
-        face_num = int(model.mesh_facenum[mesh_id])
-        texcoord_adr = int(model.mesh_texcoordadr[mesh_id])
-        texcoord_num = int(model.mesh_texcoordnum[mesh_id])
-
-        texcoords = None
-        face_texcoords = None
-        if texcoord_adr != -1:
-            texcoords = model.mesh_texcoord[texcoord_adr : texcoord_adr + texcoord_num]
-            face_texcoords = model.mesh_facetexcoord[face_adr : face_adr + face_num]
-
-        return (
-            mj_id2name(model, mjtObj.mjOBJ_MESH, mesh_id),
-            vert_num,
-            face_num,
-            texcoord_num,
-            cls._array_digest(model.mesh_vert[vert_adr : vert_adr + vert_num]),
-            cls._array_digest(model.mesh_face[face_adr : face_adr + face_num]),
-            cls._array_digest(texcoords),
-            cls._array_digest(face_texcoords),
-        )
-
-    @classmethod
-    def _material_fingerprint(cls, model, mat_id: int) -> tuple:
-        tex_id = cls._material_rgb_texture_id(model, mat_id)
-        texture_fp = None
-        if tex_id != -1:
-            texture_fp = cls._texture_fingerprint(model, tex_id)
-
-        return (
-            mj_id2name(model, mjtObj.mjOBJ_MATERIAL, mat_id),
-            cls._array_digest(model.mat_rgba[mat_id]),
-            float(model.mat_specular[mat_id]),
-            float(model.mat_shininess[mat_id]),
-            float(model.mat_reflectance[mat_id]),
-            cls._array_digest(model.mat_texrepeat[mat_id]),
-            texture_fp,
-        )
-
-    @staticmethod
-    def _material_rgb_texture_id(model, mat_id: int) -> int:
-        tex_id = model.mat_texid[mat_id]
-        if isinstance(tex_id, np.ndarray):
-            return int(tex_id[1])
-        return int(tex_id)
-
-    @classmethod
-    def _texture_fingerprint(cls, model, tex_id: int) -> tuple:
-        height = int(model.tex_height[tex_id])
-        width = int(model.tex_width[tex_id])
-        nchannel = (
-            int(model.tex_nchannel[tex_id]) if hasattr(model, "tex_nchannel") else 3
-        )
-        tex_adr = int(model.tex_adr[tex_id])
-        tex_num = height * width * nchannel
-        tex_data = model.tex_data if hasattr(model, "tex_data") else model.tex_rgb
-
-        return (
-            mj_id2name(model, mjtObj.mjOBJ_TEXTURE, tex_id),
-            height,
-            width,
-            nchannel,
-            cls._array_digest(tex_data[tex_adr : tex_adr + tex_num]),
-        )
-
-    @staticmethod
-    def _array_digest(array) -> bytes | None:
-        if array is None:
-            return None
-        arr = np.asarray(array)
-        hasher = hashlib.blake2b(digest_size=16)
-        hasher.update(str(arr.dtype).encode("ascii"))
-        hasher.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
-        hasher.update(np.ascontiguousarray(arr).tobytes())
-        return hasher.digest()
-
     def rebind(self, env) -> None:
         """Re-bind to env's fresh mj_model/mj_data after a hard reset, no network I/O.
 
         robosuite's default ``hard_reset=True`` on ``env.reset()`` replaces
         ``env.sim`` (and thus the raw mj_model/mj_data) on every reset,
-        orphaning the numpy views grabbed at construction time.  Use this
-        when scene content is known to be unchanged — the next
-        ``publish_state()`` will paint the new poses.
+        orphaning the numpy views grabbed at construction time.  This is only
+        for callers that intentionally want pose-only rebinding.
         """
         self.model = env.sim.model._model
         self.data = env.sim.data._data
@@ -563,39 +650,18 @@ class QuestPublisher:
     def refresh(self, env, force: bool = False) -> None:
         """Resync after ``env.reset()``.
 
-        With ``force=False`` (default), if the new env's rendered scene content
-        matches the one captured at construction, only re-bind numpy views
-        — no scene resend, no Unity-side rebuild, no visible flash.  If the
-        content changed, fall back to a full rebind + scene resend with a
-        warning.
-
-        With ``force=True``, always do the full rebind + scene resend.
-        Use as an explicit escape hatch.
+        Always send the complete logical scene manifest.  Asset bytes are served
+        only in response to headset asset_request messages.
         """
         self.model = env.sim.model._model
         self.data = env.sim.data._data
-        new_fp = self._structure_fingerprint(self.model, self.visible_geoms_groups)
-
-        if not force:
-            if new_fp == self._structure_fp:
-                self._rebuild_tracked()
-                logger.info(
-                    "Scene content unchanged; rebinding only, reusing existing Quest scene."
-                )
-                return
-            logger.warning(
-                "Scene content changed across reset; falling back to full scene resend."
-            )
-        else:
-            logger.info("Force-refreshing Quest scene.")
 
         self._parse_scene()
         self._rebuild_tracked()
-        self._structure_fp = new_fp
         # Only hit the network if connected; otherwise the supervisor's
         # reconnect will resend this now-current scene once the socket is back.
         if self._connected.is_set():
-            self._run(self._send("scene", self._scene_payload()))
+            self._run(self._send_scene_manifest())
 
     def close(self):
         # Stop the supervisor from reconnecting once we start tearing down.
