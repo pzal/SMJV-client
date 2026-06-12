@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 _ALPHA_EPSILON = 1e-6
 
+# MuJoCo's default geom rgba. A geom whose rgba differs from this is treated by
+# MuJoCo's renderer as overriding its material's base color, so we do the same.
+_DEFAULT_GEOM_RGBA = (0.5, 0.5, 0.5, 1.0)
+
 
 class MjSceneParser:
     def __init__(self, model, visible_geoms_groups, no_rendered_objects=None):
@@ -109,10 +113,19 @@ class MjSceneParser:
         if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
             mesh = self._process_mesh(model, int(model.geom_dataid[geom_id]))
 
-        material = create_material(model.geom_rgba[geom_id].tolist())
+        geom_rgba = model.geom_rgba[geom_id].tolist()
         mat_id = int(model.geom_matid[geom_id])
         if mat_id != -1:
             material = self._process_material(model, mat_id)
+            # MuJoCo treats a non-default geom_rgba as an override of the
+            # material's base color (texture/specular/shininess still come from
+            # the material). Replicate that so per-geom recolors (e.g.
+            # domain-randomization variants) are visible in VR, not just in
+            # MuJoCo's own renderer.
+            if not self._is_default_geom_rgba(geom_rgba):
+                material["color"] = geom_rgba
+        else:
+            material = create_material(geom_rgba)
 
         return SimVisual(
             name=geom_name, type=visual_type, mesh=mesh, material=material, trans=trans
@@ -129,6 +142,12 @@ class MjSceneParser:
         if geom_name is None:
             return False
         return geom_name == "reg_bbox" or geom_name.endswith("_reg_bbox")
+
+    @staticmethod
+    def _is_default_geom_rgba(rgba) -> bool:
+        return all(
+            abs(c - d) < _ALPHA_EPSILON for c, d in zip(rgba, _DEFAULT_GEOM_RGBA)
+        )
 
     @staticmethod
     def _geom_alpha(model, geom_id: int) -> float:
